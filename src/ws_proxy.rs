@@ -235,7 +235,6 @@ async fn relay_via_ws(
     let url = ws_url(dc);
     let mut request = url.as_str().into_client_request()?;
 
-    // Required by the Telegram WebSocket transport protocol
     request
         .headers_mut()
         .insert("Sec-WebSocket-Protocol", "binary".parse()?);
@@ -244,55 +243,56 @@ async fn relay_via_ws(
         native_tls::TlsConnector::new().map_err(|e| format!("TLS: {}", e))?,
     );
 
-    let (ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(
+    let (mut ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(
         request, None, false, Some(connector),
     )
     .await?;
 
-    let (mut ws_tx, mut ws_rx) = ws.split();
     let (mut tcp_rx, mut tcp_tx) = tokio::io::split(tcp_stream);
 
     // Send the buffered 64-byte init as the first WebSocket message
-    ws_tx
-        .send(tungstenite::Message::Binary(init.to_vec()))
-        .await?;
+    ws.send(tungstenite::Message::Binary(init.to_vec())).await?;
 
-    let up = async {
-        let mut buf = vec![0u8; 32768];
-        loop {
-            match tcp_rx.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    let msg = tungstenite::Message::Binary(buf[..n].to_vec());
-                    if ws_tx.send(msg).await.is_err() {
-                        break;
+    // Single loop: handles TCP→WS, WS→TCP, and Ping/Pong in one place.
+    // This ensures Pong replies are sent immediately so the server
+    // doesn't kill the connection after a timeout.
+    let mut buf = vec![0u8; 32768];
+
+    loop {
+        tokio::select! {
+            biased;
+
+            ws_msg = ws.next() => {
+                match ws_msg {
+                    Some(Ok(tungstenite::Message::Binary(data))) => {
+                        if tcp_tx.write_all(data.as_ref()).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(tungstenite::Message::Ping(payload))) => {
+                        let _ = ws.send(tungstenite::Message::Pong(payload)).await;
+                    }
+                    Some(Ok(tungstenite::Message::Close(_))) | None => break,
+                    Some(Err(_)) => break,
+                    _ => {}
+                }
+            }
+
+            n = tcp_rx.read(&mut buf) => {
+                match n {
+                    Ok(0) | Err(_) => break,
+                    Ok(n) => {
+                        let msg = tungstenite::Message::Binary(buf[..n].to_vec());
+                        if ws.send(msg).await.is_err() {
+                            break;
+                        }
                     }
                 }
-                Err(_) => break,
             }
         }
-        let _ = ws_tx.close().await;
-    };
-
-    let down = async {
-        while let Some(Ok(msg)) = ws_rx.next().await {
-            match msg {
-                tungstenite::Message::Binary(data) => {
-                    if tcp_tx.write_all(&data).await.is_err() {
-                        break;
-                    }
-                }
-                tungstenite::Message::Close(_) => break,
-                _ => {}
-            }
-        }
-    };
-
-    tokio::select! {
-        _ = up => {}
-        _ = down => {}
     }
 
+    let _ = ws.close(None).await;
     Ok(())
 }
 
