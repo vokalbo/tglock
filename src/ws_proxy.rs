@@ -36,7 +36,6 @@ pub async fn run_proxy(port: u16, stats: Arc<ProxyStats>) -> Result<(), String> 
         if !stats.running.load(Ordering::SeqCst) {
             break;
         }
-
         tokio::select! {
             result = listener.accept() => {
                 if let Ok((stream, _)) = result {
@@ -57,18 +56,69 @@ pub async fn run_proxy(port: u16, stats: Arc<ProxyStats>) -> Result<(), String> 
     Ok(())
 }
 
-/// DC name mapping from official Telegram MTProto transport docs
-fn dc_ws_url(dc: u8) -> String {
-    let name = match dc {
-        1 => "pluto",
-        2 => "venus",
-        3 => "aurora",
-        4 => "vesta",
-        5 => "flora",
-        _ => "venus",
-    };
-    format!("wss://{}.web.telegram.org/apiws", name)
+// ---------------------------------------------------------------------------
+// DC extraction from obfuscated2 init packet (same method as tg-ws-proxy)
+// ---------------------------------------------------------------------------
+
+fn extract_dc_from_init(init: &[u8; 64]) -> Option<u8> {
+    use aes::Aes256;
+    use cipher::{KeyIvInit, StreamCipher};
+    type Aes256Ctr = ctr::Ctr128BE<Aes256>;
+
+    let key = &init[8..40];
+    let iv = &init[40..56];
+
+    let mut dec = [0u8; 64];
+    dec.copy_from_slice(init);
+
+    let mut cipher = Aes256Ctr::new(key.into(), iv.into());
+    cipher.apply_keystream(&mut dec);
+
+    let dc_id = i32::from_le_bytes([dec[60], dec[61], dec[62], dec[63]]);
+    let dc = dc_id.unsigned_abs() as u8;
+    if (1..=5).contains(&dc) {
+        Some(dc)
+    } else {
+        None
+    }
 }
+
+fn dc_from_ip(ip: Ipv4Addr) -> Option<u8> {
+    let o = ip.octets();
+    match (o[0], o[1]) {
+        (149, 154) => Some(match o[2] {
+            160..=163 => 1,
+            164..=167 => 2,
+            168..=171 => 3,
+            172..=175 => 1,
+            _ => 2,
+        }),
+        (91, 108) => Some(match o[2] {
+            56..=59 => 5,
+            8..=11 => 3,
+            12..=15 => 4,
+            _ => 2,
+        }),
+        (91, 105) | (185, 76) => Some(2),
+        _ => None,
+    }
+}
+
+fn is_telegram_ip(addr: &str) -> bool {
+    addr.parse::<Ipv4Addr>()
+        .ok()
+        .and_then(dc_from_ip)
+        .is_some()
+}
+
+/// Endpoint format used by the proven tg-ws-proxy project
+fn ws_url(dc: u8) -> String {
+    format!("wss://kws{}.web.telegram.org/apiws", dc)
+}
+
+// ---------------------------------------------------------------------------
+// SOCKS5 handler
+// ---------------------------------------------------------------------------
 
 async fn handle_socks5(
     mut stream: TcpStream,
@@ -76,6 +126,7 @@ async fn handle_socks5(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     stream.set_nodelay(true)?;
 
+    // --- auth negotiation ---
     let mut buf = [0u8; 258];
     let n = stream.read(&mut buf).await?;
     if n < 2 || buf[0] != 0x05 {
@@ -83,6 +134,7 @@ async fn handle_socks5(
     }
     stream.write_all(&[0x05, 0x00]).await?;
 
+    // --- CONNECT request ---
     let n = stream.read(&mut buf).await?;
     if n < 7 || buf[0] != 0x05 || buf[1] != 0x01 {
         stream.write_all(&[0x05, 0x07, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
@@ -90,38 +142,47 @@ async fn handle_socks5(
     }
 
     let (dest_addr, dest_port) = parse_dest(&buf[3..n])?;
+    let is_tg = is_telegram_ip(&dest_addr);
 
-    let dc = dest_addr
-        .parse::<Ipv4Addr>()
-        .ok()
-        .and_then(telegram_dc);
+    // SOCKS5 success (we handle the connection ourselves)
+    stream
+        .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x04, 0x38])
+        .await?;
 
-    if let Some(dc_id) = dc {
-        stream
-            .write_all(&[0x05, 0x00, 0x00, 0x01, 127, 0, 0, 1, 0x04, 0x38])
-            .await?;
+    if is_tg {
+        // Read the first 64 bytes — obfuscated2 init packet
+        let mut init = [0u8; 64];
+        stream.read_exact(&mut init).await?;
+
+        // Extract DC from init packet (primary), fall back to IP-based
+        let dc = extract_dc_from_init(&init).unwrap_or_else(|| {
+            dest_addr
+                .parse::<Ipv4Addr>()
+                .ok()
+                .and_then(dc_from_ip)
+                .unwrap_or(2)
+        });
 
         stats.ws_active.fetch_add(1, Ordering::Relaxed);
-        let result = relay_via_ws(stream, dc_id).await;
+
+        // Try WebSocket tunnel; fall back to direct TCP on failure
+        let ws_result = relay_via_ws(stream, dc, &init).await;
+
         stats.ws_active.fetch_sub(1, Ordering::Relaxed);
 
-        if let Err(e) = result {
-            return Err(format!("WS tunnel DC{}: {}", dc_id, e).into());
+        if let Err(e) = ws_result {
+            return Err(format!("DC{} tunnel: {}", dc, e).into());
         }
     } else {
+        // Non-Telegram — direct TCP passthrough
         let target = format!("{}:{}", dest_addr, dest_port);
         match TcpStream::connect(&target).await {
             Ok(remote) => {
                 let _ = remote.set_nodelay(true);
-                stream
-                    .write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                    .await?;
                 relay_tcp(stream, remote).await;
             }
-            Err(_) => {
-                stream
-                    .write_all(&[0x05, 0x05, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
-                    .await?;
+            Err(e) => {
+                return Err(format!("TCP connect {}: {}", target, e).into());
             }
         }
     }
@@ -160,61 +221,41 @@ fn parse_dest(data: &[u8]) -> Result<(String, u16), Box<dyn std::error::Error + 
     }
 }
 
-fn telegram_dc(ip: Ipv4Addr) -> Option<u8> {
-    let o = ip.octets();
-    match (o[0], o[1]) {
-        (149, 154) => Some(match o[2] {
-            160..=163 => 1,
-            164..=167 => 2,
-            168..=171 => 3,
-            172..=175 => 1,
-            _ => 2,
-        }),
-        (91, 108) => Some(match o[2] {
-            56..=59 => 5,
-            8..=11 => 3,
-            12..=15 => 4,
-            _ => 2,
-        }),
-        (91, 105) => Some(2),
-        (185, 76) => Some(2),
-        _ => None,
-    }
-}
+// ---------------------------------------------------------------------------
+// WebSocket tunnel — reads init first, then relays
+// ---------------------------------------------------------------------------
 
 async fn relay_via_ws(
     tcp_stream: TcpStream,
-    dc_id: u8,
+    dc: u8,
+    init: &[u8; 64],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use futures_util::{SinkExt, StreamExt};
 
-    let ws_url = dc_ws_url(dc_id);
-    let mut request = ws_url.as_str().into_client_request()?;
+    let url = ws_url(dc);
+    let mut request = url.as_str().into_client_request()?;
 
     // Required by the Telegram WebSocket transport protocol
-    request.headers_mut().insert(
-        "Sec-WebSocket-Protocol",
-        "binary".parse()?,
-    );
-    request.headers_mut().insert(
-        "Origin",
-        "https://web.telegram.org".parse()?,
-    );
+    request
+        .headers_mut()
+        .insert("Sec-WebSocket-Protocol", "binary".parse()?);
 
     let connector = tokio_tungstenite::Connector::NativeTls(
         native_tls::TlsConnector::new().map_err(|e| format!("TLS: {}", e))?,
     );
 
     let (ws, _resp) = tokio_tungstenite::connect_async_tls_with_config(
-        request,
-        None,
-        false,
-        Some(connector),
+        request, None, false, Some(connector),
     )
     .await?;
 
     let (mut ws_tx, mut ws_rx) = ws.split();
     let (mut tcp_rx, mut tcp_tx) = tokio::io::split(tcp_stream);
+
+    // Send the buffered 64-byte init as the first WebSocket message
+    ws_tx
+        .send(tungstenite::Message::Binary(init.to_vec()))
+        .await?;
 
     let up = async {
         let mut buf = vec![0u8; 32768];
