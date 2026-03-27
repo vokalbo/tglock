@@ -1,0 +1,8 @@
+/target
+/tools
+/.github
+/.git
+*.zip
+*.exe
+!*.rs
+Cargo.lock
