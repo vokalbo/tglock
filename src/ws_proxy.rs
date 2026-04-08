@@ -108,7 +108,7 @@ fn is_telegram_ip(addr: &str) -> bool {
     if let Ok(ipv6) = addr.parse::<std::net::Ipv6Addr>() {
         // Проверка IPv6 подсетей Telegram
         let octets = ipv6.octets();
-        return (octets[0] == 0x20 && octets[1] == 0x01 && octets[2] == 0x0b && octets[3] == 0x21);
+        return octets[0] == 0x20 && octets[1] == 0x01 && octets[2] == 0x0b && octets[3] == 0x21;
     }
     false
 }
@@ -212,7 +212,7 @@ async fn read_init_packet(stream: &mut TcpStream) -> Result<[u8; 64], std::io::E
 }
 
 async fn direct_tcp_connection(
-    mut client: TcpStream,
+    client: TcpStream,
     target: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     match TcpStream::connect(target).await {
