@@ -1,7 +1,5 @@
 #![cfg_attr(all(target_os = "windows", not(debug_assertions)), windows_subsystem = "windows")]
 
-// mod bypass; какая-то не нужная фигня, попытка испортить dns сервер в корпоративных сетях, нужно выпилить
-// mod network; не понял зачем нужно, использует windows специлизированные команды, нужно выключить
 mod ws_proxy;
 
 use std::sync::atomic::Ordering;
@@ -9,14 +7,12 @@ use std::sync::{Arc, Mutex};
 
 use eframe::egui;
 
-const PROXY_PORT: u16 = 1081; // порт нужно было поменять что бы не пересекаться c GoodbyeDPI
+const PROXY_PORT: u16 = 1081;
 
-fn main() -> eframe::Result<()> {
+fn main() {
     let options = eframe::NativeOptions {
-        viewport: egui::ViewportBuilder::default()
-            .with_inner_size([680.0, 560.0])
-            .with_min_inner_size([580.0, 460.0])
-            .with_title("TG Unblock"),
+        initial_window_size: Some(egui::vec2(680.0, 560.0)),
+        min_window_size: Some(egui::vec2(580.0, 460.0)),
         ..Default::default()
     };
 
@@ -24,16 +20,11 @@ fn main() -> eframe::Result<()> {
         "TG Unblock",
         options,
         Box::new(|cc| {
-            setup_fonts(&cc.egui_ctx);
-            Ok(Box::new(App::new()))
+            // Включаем адаптивную тему (по умолчанию следует за системой)
+            cc.egui_ctx.set_visuals(egui::Visuals::default());
+            Box::new(App::new())
         }),
     )
-}
-
-// тут была какая-то хрень, которая ставила Windows шрифт, использовать её было нельзя, deepseek написал затычку
-fn setup_fonts(ctx: &egui::Context) {
-    let mut fonts = egui::FontDefinitions::default();
-    ctx.set_fonts(fonts);
 }
 
 #[derive(Clone)]
@@ -46,37 +37,15 @@ struct LogEntry {
 struct App {
     log: Arc<Mutex<Vec<LogEntry>>>,
     proxy_stats: Arc<ws_proxy::ProxyStats>,
-    is_admin: bool,
-    adapter_name: Arc<Mutex<Option<String>>>,
-    //dns_set: Arc<Mutex<bool>>,
 }
 
 impl App {
     fn new() -> Self {
-        // мы не админы, даже если админы, портить систему нельзя.
-        // let is_admin = bypass::check_admin();
-        let is_admin = false;
         let app = Self {
             log: Arc::new(Mutex::new(Vec::new())),
             proxy_stats: ws_proxy::ProxyStats::new(),
-            is_admin,
-            adapter_name: Arc::new(Mutex::new(None)),
-            //dns_set: Arc::new(Mutex::new(false)),
         };
         log_msg(&app.log, "Запущено", false);
-        //if !is_admin {
-        //    log_msg(&app.log, "Нет прав администратора — DNS менять не получится", true);
-        //}
-        //{
-        //    let adapter = app.adapter_name.clone();
-        //    let log = app.log.clone();
-        //    std::thread::spawn(move || {
-        //        if let Some(name) = network::detect_adapter() {
-        //            log_msg(&log, &format!("Адаптер: {}", name), false);
-        //            *adapter.lock().unwrap() = Some(name);
-        //        }
-        //    });
-        //}
         app
     }
 
@@ -90,23 +59,8 @@ impl App {
         }
         let stats = self.proxy_stats.clone();
         let log = self.log.clone();
-        let adapter = self.adapter_name.clone();
-        //let dns_set = self.dns_set.clone();
-        let is_admin = self.is_admin;
 
         std::thread::spawn(move || {
-            // DNS - это делать нельзя, это ломает внутрение сайты
-            //if is_admin {
-            //    let aname = adapter.lock().unwrap().clone().or_else(network::detect_adapter);
-            //    if let Some(ref name) = aname {
-            //        if bypass::set_dns(name, "1.1.1.1", "1.0.0.1").is_ok() {
-            //            bypass::flush_dns();
-            //            log_msg(&log, "DNS → Cloudflare 1.1.1.1", false);
-            //            *dns_set.lock().unwrap() = true;
-            //        }
-            //    }
-            //}
-
             log_msg(&log, &format!("Запускаю WS-прокси на 127.0.0.1:{}...", PROXY_PORT), false);
 
             let rt = tokio::runtime::Runtime::new().unwrap();
@@ -125,22 +79,6 @@ impl App {
     fn stop_proxy(&self) {
         self.proxy_stats.running.store(false, Ordering::SeqCst);
         log_msg(&self.log, "Прокси остановлен", false);
-
-	//Если мы ничего не ломали, то не нужно и чинить
-        //if *self.dns_set.lock().unwrap() {
-        //    let adapter = self.adapter_name.clone();
-        //    let log = self.log.clone();
-        //    let dns_set = self.dns_set.clone();
-        //    std::thread::spawn(move || {
-        //        let aname = adapter.lock().unwrap().clone().or_else(network::detect_adapter);
-        //        if let Some(ref name) = aname {
-        //            let _ = bypass::reset_dns(name);
-        //            bypass::flush_dns();
-        //            *dns_set.lock().unwrap() = false;
-        //            log_msg(&log, "DNS сброшен", false);
-        //        }
-        //    });
-        //}
     }
 
     fn open_tg_proxy_link(&self) {
@@ -179,7 +117,7 @@ impl eframe::App for App {
                 ui.separator();
                 if running {
                     ui.colored_label(
-                        egui::Color32::from_rgb(80, 220, 120),
+                        ui.visuals().widgets.active.fg_stroke.color,
                         egui::RichText::new("ПРОКСИ РАБОТАЕТ").strong(),
                     );
                     ui.separator();
@@ -203,9 +141,9 @@ impl eframe::App for App {
                         let logs = self.log.lock().unwrap();
                         for e in logs.iter() {
                             let color = if e.is_error {
-                                egui::Color32::from_rgb(255, 100, 100)
+                                ui.visuals().error_fg_color
                             } else {
-                                egui::Color32::from_rgb(170, 215, 170)
+                                ui.visuals().widgets.noninteractive.fg_stroke.color
                             };
                             ui.colored_label(color, format!("[{}] {}", e.ts, e.text));
                         }
@@ -218,20 +156,20 @@ impl eframe::App for App {
 
             // --- VPN ad (top) ---
             ui.vertical_centered(|ui| {
-                egui::Frame::new()
-                    .fill(egui::Color32::from_rgb(25, 30, 42))
-                    .corner_radius(8.0)
-                    .inner_margin(egui::Margin::symmetric(14, 8))
+                egui::Frame::none()
+                    .fill(ui.visuals().widgets.inactive.bg_fill)
+                    .rounding(8.0)
+                    .inner_margin(egui::style::Margin::symmetric(14.0, 8.0))
                     .show(ui, |ui| {
                         ui.horizontal(|ui| {
                             ui.colored_label(
-                                egui::Color32::from_rgb(100, 180, 255),
+                                ui.visuals().hyperlink_color,
                                 egui::RichText::new("by sonic VPN").size(13.0).strong(),
                             );
                             ui.label(
                                 egui::RichText::new("Полный обход для всех приложений")
                                     .size(12.0)
-                                    .color(egui::Color32::from_rgb(160, 165, 180)),
+                                    .color(ui.visuals().widgets.noninteractive.fg_stroke.color),
                             );
                             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                 if ui.add(
@@ -239,7 +177,7 @@ impl eframe::App for App {
                                         egui::RichText::new("@bysonicvpn_bot")
                                             .size(12.0)
                                             .strong()
-                                            .color(egui::Color32::from_rgb(100, 200, 255)),
+                                            .color(ui.visuals().hyperlink_color),
                                     )
                                     .frame(false),
                                 ).clicked() {
@@ -268,7 +206,7 @@ impl eframe::App for App {
                     }
                 } else {
                     ui.colored_label(
-                        egui::Color32::from_rgb(80, 220, 120),
+                        ui.visuals().widgets.active.fg_stroke.color,
                         egui::RichText::new("Обход работает").size(22.0).strong(),
                     );
                     ui.add_space(5.0);
@@ -276,7 +214,6 @@ impl eframe::App for App {
                     ui.label(format!("WebSocket-туннелей: {} | Соединений: {}", ws, active));
                     ui.add_space(12.0);
 
-                    // Stop button
                     let stop = ui.add_sized(
                         [340.0, 42.0],
                         egui::Button::new(egui::RichText::new("Остановить").size(17.0)),
@@ -291,7 +228,6 @@ impl eframe::App for App {
             ui.separator();
             ui.add_space(8.0);
 
-            // --- Telegram setup ---
             ui.heading("Настройка Telegram Desktop");
             ui.add_space(6.0);
 
@@ -326,7 +262,6 @@ impl eframe::App for App {
             ui.separator();
             ui.add_space(5.0);
 
-            // --- How it works ---
             ui.heading("Как это работает");
             ui.add_space(4.0);
             ui.label("1. Локальный SOCKS5-прокси принимает соединения от Telegram");
@@ -335,10 +270,9 @@ impl eframe::App for App {
             ui.label("4. Провайдер/DPI не видит MTProto, не может замедлить");
             ui.add_space(4.0);
             ui.colored_label(
-                egui::Color32::from_rgb(170, 170, 170),
+                ui.visuals().widgets.noninteractive.fg_stroke.color,
                 "Не-Telegram трафик проходит напрямую без изменений",
             );
-
         });
     }
 }
